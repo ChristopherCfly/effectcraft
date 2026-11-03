@@ -5,7 +5,8 @@
 //! The comp is 33×20 so 24-bit rows (99 bytes) need their padding byte, and a 16-px solid centred
 //! in it sits on a half pixel, so its edges carry partial alpha.
 
-use std::path::{Path, PathBuf};
+use crate::out::out_dir;
+use std::path::Path;
 use std::process::Command;
 
 use effectcraft_color::Label;
@@ -20,13 +21,6 @@ use filmcraft_isobmff::TrackKind;
 const W: u32 = 33;
 const H: u32 = 20;
 const FRAMES: u64 = 6;
-
-fn out_dir(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-out/export").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    d
-}
 
 /// 16-bit stereo 48 kHz WAV: a 440 Hz sine at 0.5 on the left, silence on the right.
 fn write_tone(path: &Path, secs: f64) {

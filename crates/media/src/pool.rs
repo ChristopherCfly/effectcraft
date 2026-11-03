@@ -161,8 +161,14 @@ pub struct PoolStats {
     /// Frames currently cached and their total size in bytes.
     pub frames: usize,
     pub bytes: usize,
-    /// Movie and audio files opened (each path once, however many callers ask for it at once).
+    /// Movie and audio files opened (each path once, however many callers ask for it at once;
+    /// again after it was closed).
     pub opened: u64,
+    /// Movie and audio sources open now.
+    pub open: usize,
+    /// Picture sources closed because a sequential render stopped reading them
+    /// ([`MediaPool::set_idle_release`]).
+    pub released: u64,
 }
 
 #[derive(Default)]
@@ -179,14 +185,46 @@ struct CacheState {
 /// (`None`: failed to open; not retried until `forget`).
 type SourceSlot = Arc<OnceLock<Option<(SharedSource, Orientation)>>>;
 
+/// What a source in the pool is opened for. A movie's audio, and its pictures too by default,
+/// come from one source per file. With idle release on ([`MediaPool::set_idle_release`]),
+/// pictures come from a source of their own: those keep the decoded frames, and are the ones
+/// closed once unread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Reader {
+    Shared,
+    Pictures,
+}
+
+/// A source in the pool and when it was last asked for: the frames a sequential render had
+/// finished then ([`MediaPool::release_idle`]).
+struct Open {
+    slot: SourceSlot,
+    step: u64,
+}
+
+impl Open {
+    /// Whether nobody but the pool holds it: it has finished opening, opened (a file that failed
+    /// to open holds nothing and is not retried), and no reader holds its source.
+    fn unheld(&self) -> bool {
+        Arc::strong_count(&self.slot) == 1 && matches!(self.slot.get(), Some(Some((src, _))) if Arc::strong_count(src) == 1)
+    }
+}
+
 /// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
 type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
 
 struct Inner {
-    /// Opened movie/audio sources by path.
-    sources: Mutex<HashMap<Arc<str>, SourceSlot>>,
+    /// Opened movie/audio sources by path and what they were opened for.
+    sources: Mutex<HashMap<(Arc<str>, Reader), Open>>,
     /// Files opened into `sources` (see [`PoolStats::opened`]).
     opened: AtomicU64,
+    /// Frames of a sequential render a picture source may go unread before
+    /// [`MediaPool::release_idle`] closes it (0: never, and pictures share their file's source).
+    idle_steps: AtomicU64,
+    /// Frames the render has finished ([`MediaPool::release_idle`]).
+    step: AtomicU64,
+    /// Sources it closed (see [`PoolStats::released`]).
+    released: AtomicU64,
     /// In-memory files registered with `add_bytes` (web builds, tests).
     files: Mutex<HashMap<String, Arc<[u8]>>>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
@@ -280,6 +318,9 @@ impl MediaPool {
                 misses: AtomicU64::new(0),
                 prefetched: AtomicU64::new(0),
                 opened: AtomicU64::new(0),
+                idle_steps: AtomicU64::new(0),
+                step: AtomicU64::new(0),
+                released: AtomicU64::new(0),
                 conform: Mutex::default(),
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
@@ -306,6 +347,7 @@ impl MediaPool {
 
     pub fn stats(&self) -> PoolStats {
         let i = &self.inner;
+        let open = lock(&i.sources).values().filter(|o| matches!(o.slot.get(), Some(Some(_)))).count();
         let c = lock(&i.cache);
         PoolStats {
             hits: i.hits.load(Ordering::Relaxed),
@@ -314,7 +356,58 @@ impl MediaPool {
             frames: c.lru.map.len(),
             bytes: c.lru.bytes,
             opened: i.opened.load(Ordering::Relaxed),
+            open,
+            released: i.released.load(Ordering::Relaxed),
         }
+    }
+
+    /// Close a movie's picture decoder once a sequential render has finished `frames` frames
+    /// without reading it ([`MediaPool::release_idle`]); `None` (the default) keeps every decoder
+    /// open until [`MediaPool::forget`] or [`MediaPool::clear`]. Set it before reading.
+    ///
+    /// Interactive playback wants decoders open: a clip scrubbed back to would otherwise decode
+    /// from its keyframe again. A sequential render (an export) never comes back to most clips,
+    /// and each open picture decoder keeps up to a few hundred megabytes of decoded frames, so a
+    /// render that turns this on keeps only the picture decoders of the clips it is showing open.
+    /// A closed decoder opens again when the clip is read, decodes from its keyframe and gives the
+    /// same frames; if it can't open again (the file went away), the clip's pictures come from
+    /// its shared source. With this on, a movie's pictures come from a source of their own;
+    /// audio keeps its file's source open, as a track's decoded audio depends on what its decoder
+    /// decoded before (AAC is decoded on from one packet of pre-roll after a seek), so a reopened
+    /// one could sound different where a render plays a passage again. An open audio reader keeps
+    /// no decoded pictures, but does keep the audio it decoded (FilmCraft keeps up to 4096 packets
+    /// a file, about 32 MB of stereo AAC; a few MB for a clip of a few seconds). `Some(0)` counts
+    /// as `Some(1)`.
+    pub fn set_idle_release(&self, frames: Option<u32>) {
+        self.inner.idle_steps.store(frames.map_or(0, |f| u64::from(f.max(1))), Ordering::Relaxed);
+    }
+
+    /// The frames set with [`MediaPool::set_idle_release`].
+    pub fn idle_release(&self) -> Option<u32> {
+        let steps = self.inner.idle_steps.load(Ordering::Relaxed);
+        (steps > 0).then(|| u32::try_from(steps).unwrap_or(u32::MAX))
+    }
+
+    /// A sequential render (an export) finished `frames` more frames, a batch: with
+    /// [`MediaPool::set_idle_release`] on, close the picture decoders not read since that many
+    /// frames before this batch (so at least that many frames after the batch they were last read
+    /// in, for batches of one size), and return how many closed. A source a reader holds, or one
+    /// still opening, stays open.
+    pub fn release_idle(&self, frames: u64) -> usize {
+        let i = &self.inner;
+        let idle = i.idle_steps.load(Ordering::Relaxed);
+        if idle == 0 {
+            return 0;
+        }
+        let closed: Vec<Open> = {
+            let mut sources = lock(&i.sources);
+            let now = i.step.fetch_add(frames, Ordering::Relaxed).saturating_add(frames);
+            let after = idle.saturating_add(frames);
+            sources.extract_if(|(_, r), o| *r == Reader::Pictures && now.saturating_sub(o.step) >= after && o.unheld()).map(|(_, o)| o).collect()
+        };
+        i.released.fetch_add(closed.len() as u64, Ordering::Relaxed);
+        // (the decoders and their frames are freed here, outside the lock)
+        closed.len()
     }
 
     /// Drop every cached frame (decoders stay open).
@@ -336,7 +429,7 @@ impl MediaPool {
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
     pub fn forget(&self, path: &str) {
-        lock(&self.inner.sources).remove(path);
+        lock(&self.inner.sources).retain(|(p, _), _| &**p != path);
         lock(&self.inner.models).remove(path);
         lock(&self.inner.gifs).remove(path);
         lock(&self.inner.problems).remove(path);
@@ -590,12 +683,39 @@ impl Inner {
     /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
     /// decoded a long FLAC in full at once (#408).
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        self.opened(path).map(|(src, _)| src)
+        self.opened(path, Reader::Shared).map(|(src, _)| src)
     }
 
-    /// [`Self::source`] and the turn the movie's picture is shown with.
-    fn opened(&self, path: &Arc<str>) -> Option<(SharedSource, Orientation)> {
-        let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
+    /// The source movie frames are read from: their file's shared one, or with idle release on
+    /// one of their own ([`MediaPool::set_idle_release`]).
+    fn picture_reader(&self) -> Reader {
+        if self.idle_steps.load(Ordering::Relaxed) > 0 { Reader::Pictures } else { Reader::Shared }
+    }
+
+    /// The source movie frames of `path` are read from ([`Self::picture_reader`]), and the turn
+    /// the picture is shown with. A picture source of its own that can't open (the file went away
+    /// after the render closed it) falls back to the file's shared source, which its audio may
+    /// still hold open.
+    fn picture_source(&self, path: &Arc<str>) -> Option<(SharedSource, Orientation)> {
+        match self.picture_reader() {
+            Reader::Pictures => self.opened(path, Reader::Pictures).or_else(|| self.opened(path, Reader::Shared)),
+            Reader::Shared => self.opened(path, Reader::Shared),
+        }
+    }
+
+    /// The slot of the source for `path` opened for `reader` (made empty when there is none),
+    /// marked as asked for now ([`MediaPool::release_idle`]).
+    fn slot(&self, path: &Arc<str>, reader: Reader) -> SourceSlot {
+        let mut sources = lock(&self.sources);
+        let step = self.step.load(Ordering::Relaxed);
+        let open = sources.entry((path.clone(), reader)).or_insert_with(|| Open { slot: SourceSlot::default(), step });
+        open.step = step;
+        open.slot.clone()
+    }
+
+    /// The source for `path` opened for `reader`, and the turn the movie's picture is shown with.
+    fn opened(&self, path: &Arc<str>, reader: Reader) -> Option<(SharedSource, Orientation)> {
+        let slot = self.slot(path, reader);
         slot.get_or_init(|| {
             self.opened.fetch_add(1, Ordering::Relaxed);
             // Files on disk are read in place (the index, then samples on demand) rather than
@@ -842,7 +962,7 @@ impl Inner {
                 Ok(dynamic_to_image(frame, op))
             }
             Some(mt) => {
-                let (src, turn) = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let (src, turn) = self.picture_source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
                 let vf = src
                     .video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0)))
                     .map_err(MediaError::from)
@@ -884,6 +1004,15 @@ impl FootageSource for MediaPool {
     }
     fn forget(&self, path: &str) {
         MediaPool::forget(self, path);
+    }
+    fn set_idle_release(&self, frames: Option<u32>) {
+        MediaPool::set_idle_release(self, frames);
+    }
+    fn idle_release(&self) -> Option<u32> {
+        MediaPool::idle_release(self)
+    }
+    fn release_idle(&self, frames: u64) {
+        MediaPool::release_idle(self, frames);
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
@@ -979,6 +1108,191 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    /// A fresh, empty folder for a test under `target/`.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// One second of a 440 Hz tone, mono 16-bit PCM at `rate` Hz, written as `dir/name`.
+    fn tone_wav(dir: &std::path::Path, name: &str, rate: u32) -> Footage {
+        let pcm: Vec<u8> = (0..rate).flat_map(|n| (((n as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 8000.0) as i16).to_le_bytes()).collect();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend((36 + pcm.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend([1u16, 1].iter().flat_map(|v| v.to_le_bytes()));
+        wav.extend(rate.to_le_bytes());
+        wav.extend((rate * 2).to_le_bytes());
+        wav.extend([2u16, 16].iter().flat_map(|v| v.to_le_bytes()));
+        wav.extend(b"data");
+        wav.extend((pcm.len() as u32).to_le_bytes());
+        wav.extend(&pcm);
+        let path = dir.join(name);
+        std::fs::write(&path, &wav).unwrap();
+        Footage { path: path.to_string_lossy().into(), kind: FootageKind::Audio, duration: Tick::from_seconds_f64(1.0), has_audio: true, ..Default::default() }
+    }
+
+    /// Read a little of `footage`'s audio (which opens its source).
+    fn read_audio(pool: &MediaPool, footage: &Footage) {
+        assert_eq!(pool.audio_samples(footage, Tick::ZERO, 256, 48_000).len(), 512);
+    }
+
+    /// Open `footage` for pictures as a movie frame read does (any file opens; these tests use
+    /// short WAV files).
+    fn read_pictures(pool: &MediaPool, footage: &Footage) {
+        assert!(pool.inner.picture_source(&footage.path.as_str().into()).is_some());
+    }
+
+    /// The paths of the sources `pool` holds open for pictures of their own, sorted.
+    fn picture_sources(pool: &MediaPool) -> Vec<String> {
+        let mut open: Vec<String> = lock(&pool.inner.sources).keys().filter(|(_, r)| *r == Reader::Pictures).map(|(k, _)| k.to_string()).collect();
+        open.sort();
+        open
+    }
+
+    /// An export moving through a composition: with idle release on, each movie's picture source
+    /// closes once it has gone that many steps without a read, the one read longest ago first,
+    /// and a closed source opens again when it is read.
+    #[test]
+    fn idle_release_closes_picture_sources_in_the_order_they_went_unused() {
+        let dir = test_dir("test-idle-release-order");
+        let [a, b, c] = ["a.wav", "b.wav", "c.wav"].map(|n| tone_wav(&dir, n, 48_000));
+        let pool = MediaPool::new();
+        pool.set_idle_release(Some(1));
+        assert_eq!(pool.idle_release(), Some(1));
+        for f in [&a, &b, &c] {
+            read_pictures(&pool, f);
+        }
+        assert_eq!(pool.release_idle(1), 0, "every source was read this step");
+        assert_eq!(pool.stats().open, 3);
+        for f in [&b, &c] {
+            read_pictures(&pool, f);
+        }
+        assert_eq!(pool.release_idle(1), 1);
+        assert_eq!(picture_sources(&pool), [b.path.clone(), c.path.clone()]);
+        read_pictures(&pool, &c);
+        assert_eq!(pool.release_idle(1), 1);
+        assert_eq!(picture_sources(&pool), std::slice::from_ref(&c.path));
+        assert_eq!(pool.release_idle(1), 1);
+        assert!(picture_sources(&pool).is_empty());
+        assert_eq!((pool.stats().opened, pool.stats().released, pool.stats().open), (3, 3, 0));
+        read_pictures(&pool, &a);
+        assert_eq!(picture_sources(&pool), std::slice::from_ref(&a.path));
+        assert_eq!(pool.stats().opened, 4, "a closed source opens again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source a reader still holds, or one still being opened, is never closed however long
+    /// ago it was asked for; it closes at the first step after the reader lets go.
+    #[test]
+    fn a_source_being_read_or_opened_is_never_released() {
+        let dir = test_dir("test-idle-release-in-use");
+        let a = tone_wav(&dir, "a.wav", 48_000);
+        let pool = MediaPool::new();
+        pool.set_idle_release(Some(1));
+        let reading = pool.inner.opened(&a.path.as_str().into(), Reader::Pictures).unwrap();
+        let opening: Arc<str> = dir.join("opening.mp4").to_string_lossy().into();
+        let slot = pool.inner.slot(&opening, Reader::Pictures);
+        for _ in 0..5 {
+            assert_eq!(pool.release_idle(1), 0);
+        }
+        assert_eq!(picture_sources(&pool).len(), 2);
+        drop(reading);
+        assert_eq!(pool.release_idle(1), 1, "the reader is done");
+        assert_eq!(picture_sources(&pool), [opening.to_string()]);
+        assert!(slot.get().is_none(), "still opening");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audio readers stay open with idle release on: a track's decoded audio depends on what its
+    /// decoder decoded before (AAC is decoded on from a packet of pre-roll after a seek, and keeps
+    /// the packets it decoded), so a reopened one could sound different where the render plays a
+    /// passage again. They keep no decoded pictures.
+    #[test]
+    fn audio_readers_are_not_released() {
+        let dir = test_dir("test-idle-release-audio");
+        let a = tone_wav(&dir, "a.wav", 48_000);
+        let pool = MediaPool::new();
+        pool.set_idle_release(Some(1));
+        read_audio(&pool, &a);
+        for _ in 0..5 {
+            assert_eq!(pool.release_idle(1), 0);
+        }
+        assert_eq!((pool.stats().open, pool.stats().released), (1, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clip whose picture source closed and can't open again (here its file went away during
+    /// the render) shows its pictures from the file's shared source, which its audio holds open,
+    /// rather than nothing for the rest of the render.
+    #[test]
+    fn a_picture_source_that_cannot_reopen_falls_back_to_the_shared_one() {
+        let dir = test_dir("test-idle-release-reopen-fails");
+        let a = tone_wav(&dir, "a.wav", 48_000);
+        let pool = MediaPool::new();
+        pool.set_idle_release(Some(1));
+        read_audio(&pool, &a);
+        read_pictures(&pool, &a);
+        for _ in 0..2 {
+            pool.release_idle(1);
+        }
+        assert!(picture_sources(&pool).is_empty(), "closed");
+        std::fs::remove_file(&a.path).unwrap();
+        read_pictures(&pool, &a);
+        read_pictures(&pool, &a);
+        assert_eq!(pool.stats().open, 1, "the shared source");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Steps count the frames a render finished: a source closes once that many frames have gone
+    /// by since the batch it was last read in, however many frames a batch has.
+    #[test]
+    fn idle_release_counts_frames() {
+        let dir = test_dir("test-idle-release-frames");
+        let a = tone_wav(&dir, "a.wav", 48_000);
+        for batch in [1u64, 4, 16] {
+            let pool = MediaPool::new();
+            pool.set_idle_release(Some(48));
+            read_pictures(&pool, &a);
+            let mut done = batch;
+            pool.release_idle(batch);
+            while picture_sources(&pool).len() == 1 {
+                pool.release_idle(batch);
+                done += batch;
+            }
+            // Read in the first batch; closed after the first batch that ends 48 or more frames later.
+            assert_eq!(done, batch + 48_u64.div_ceil(batch) * batch, "batches of {batch}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Interactive playback keeps every decoder open (scrubbing back to a clip must not decode it
+    /// from its keyframe again), and a movie's pictures and audio share one: without idle
+    /// release, steps close nothing.
+    #[test]
+    fn without_idle_release_sources_stay_open_and_shared() {
+        let dir = test_dir("test-idle-release-off");
+        let [a, b] = ["a.wav", "b.wav"].map(|n| tone_wav(&dir, n, 48_000));
+        let pool = MediaPool::new();
+        assert_eq!(pool.idle_release(), None);
+        for f in [&a, &b] {
+            read_pictures(&pool, f);
+            read_audio(&pool, f);
+        }
+        for _ in 0..10 {
+            assert_eq!(pool.release_idle(1), 0);
+        }
+        assert_eq!((pool.stats().opened, pool.stats().open, pool.stats().released), (2, 2, 0), "one source per file");
+        pool.set_idle_release(Some(1));
+        pool.set_idle_release(None);
+        assert_eq!(pool.release_idle(1), 0, "turned off again");
+        assert_eq!(pool.stats().open, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Conforming a long file's audio reads every chunk at its own time: the sample index times
     /// ticks per second overflowed `i64` past 12:36 at 48 kHz, and later chunks came out silent
     /// (#172).
@@ -1003,9 +1317,7 @@ mod tests {
     /// decode).
     #[test]
     fn a_header_claiming_a_month_of_audio_is_not_conformed() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-conform-month");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("test-conform-month");
         let path = dir.join("month.flac");
         std::fs::write(&path, b"fLaC, not really").unwrap();
         let footage = Footage {
@@ -1033,9 +1345,7 @@ mod tests {
     /// in every later session (a renamed copy played).
     #[test]
     fn audio_that_fails_to_decode_is_not_conformed() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-conform-fail");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("test-conform-fail");
         let path = dir.join("song.mp3");
         std::fs::write(&path, b"ID3, not really").unwrap();
         let footage = Footage {
@@ -1069,33 +1379,9 @@ mod tests {
     // rate, so a rate of 0 panicked (division by zero); the read must come back instead.
     #[test]
     fn decoding_audio_at_a_zero_mix_rate_does_not_divide_by_zero() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-zero-rate");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // One second of a 440 Hz tone, 44.1 kHz mono 16-bit PCM: not the 48 kHz mix rate.
-        let native = 44_100u32;
-        let pcm: Vec<u8> =
-            (0..native).flat_map(|n| (((n as f32 * 440.0 * std::f32::consts::TAU / native as f32).sin() * 8000.0) as i16).to_le_bytes()).collect();
-        let mut wav = b"RIFF".to_vec();
-        wav.extend((36 + pcm.len() as u32).to_le_bytes());
-        wav.extend(b"WAVEfmt ");
-        wav.extend(16u32.to_le_bytes());
-        wav.extend([1u16, 1].iter().flat_map(|v| v.to_le_bytes()));
-        wav.extend(native.to_le_bytes());
-        wav.extend((native * 2).to_le_bytes());
-        wav.extend([2u16, 16].iter().flat_map(|v| v.to_le_bytes()));
-        wav.extend(b"data");
-        wav.extend((pcm.len() as u32).to_le_bytes());
-        wav.extend(&pcm);
-        let path = dir.join("tone.wav");
-        std::fs::write(&path, &wav).unwrap();
-        let footage = Footage {
-            path: path.to_string_lossy().into(),
-            kind: FootageKind::Audio,
-            duration: Tick::from_seconds_f64(1.0),
-            has_audio: true,
-            ..Default::default()
-        };
+        let dir = test_dir("test-zero-rate");
+        // 44.1 kHz: not the 48 kHz mix rate.
+        let footage = tone_wav(&dir, "tone.wav", 44_100);
         let pool = MediaPool::new();
         // The file really is read, and resampled, at a normal rate...
         let tone = pool.decode_audio(&footage, Tick::from_seconds_f64(0.1), 1024, 48_000);

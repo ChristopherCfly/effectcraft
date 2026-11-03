@@ -167,7 +167,7 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        let cache = LayerCache::default();
+        let cache = job.options.layer_cache_budget.map_or_else(LayerCache::default, LayerCache::new);
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
         Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
@@ -576,6 +576,40 @@ mod tests {
     use super::*;
     use rayon::prelude::*;
 
+    /// A PNG-sequence job of comp 0 with no footage or accelerator.
+    fn png_job<'a>(
+        p: &'a Project,
+        settings: &'a effectcraft_project::render_queue::RenderSettings,
+        output: &'a effectcraft_project::render_queue::OutputModule,
+        options: crate::JobOptions<'a>,
+    ) -> Job<'a> {
+        Job {
+            project: p,
+            footage: &effectcraft_render::NoFootage,
+            expr: None,
+            accel: None,
+            comp: effectcraft_project::ItemId(0),
+            settings,
+            output,
+            path: "/c/f_[#####].png",
+            sink: None,
+            nested_switches: true,
+            options,
+        }
+    }
+
+    /// The job's layer cache has the budget its options give (a session that only exports bounds
+    /// it), or the viewer's default.
+    #[test]
+    fn the_layer_cache_takes_the_jobs_budget() {
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        let (settings, output, p) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence), Project::default());
+        for (budget, want) in [(None, LayerCache::default().budget()), (Some(256 << 20), 256 << 20)] {
+            let job = png_job(&p, &settings, &output, crate::JobOptions { layer_cache_budget: budget, ..Default::default() });
+            assert_eq!(Cx::new(&job).cache.budget(), want);
+        }
+    }
+
     /// Frames `0..n` through [`map_frames`] with `cap`, recording the most running at once.
     fn run_capped(n: u64, cap: Option<usize>) -> (Vec<u64>, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -751,19 +785,7 @@ mod tests {
             }
         }
         let p = Project::default();
-        let job = Job {
-            project: &p,
-            footage: &NoFootage,
-            expr: None,
-            accel: None,
-            comp: effectcraft_project::ItemId(0),
-            settings: &settings,
-            output: &output,
-            path: "/c/f_[#####].png",
-            sink: None,
-            nested_switches: true,
-            options: Default::default(),
-        };
+        let job = png_job(&p, &settings, &output, Default::default());
         assert_eq!(Cx::new(&job).gpu_cap(), None, "no accelerator");
     }
 

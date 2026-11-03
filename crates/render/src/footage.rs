@@ -62,6 +62,19 @@ pub trait FootageSource: Send + Sync {
     /// frames, open decoders, parsed models), so the next reads see the new contents. Sources
     /// without a cache ignore it.
     fn forget(&self, _path: &str) {}
+    /// Close a movie's picture decoder once a sequential render has finished `frames` frames
+    /// without reading it ([`FootageSource::release_idle`]); `None` keeps decoders open
+    /// (interactive playback). A render that turns it on keeps open only the picture decoders
+    /// of the clips it is showing. Sources without decoders ignore it.
+    fn set_idle_release(&self, _frames: Option<u32>) {}
+    /// The frames set with [`FootageSource::set_idle_release`] (`None` when off or unsupported).
+    fn idle_release(&self) -> Option<u32> {
+        None
+    }
+    /// A sequential render (an export) finished `frames` more frames, a batch: close the
+    /// decoders it has stopped reading, as [`FootageSource::set_idle_release`] says. Sources
+    /// without decoders ignore it.
+    fn release_idle(&self, _frames: u64) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
@@ -139,6 +152,15 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn forget(&self, path: &str) {
         self.inner.forget(path)
+    }
+    fn set_idle_release(&self, frames: Option<u32>) {
+        self.inner.set_idle_release(frames)
+    }
+    fn idle_release(&self) -> Option<u32> {
+        self.inner.idle_release()
+    }
+    fn release_idle(&self, frames: u64) {
+        self.inner.release_idle(frames)
     }
     fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
         self.inner.set_conform_folder(folder)

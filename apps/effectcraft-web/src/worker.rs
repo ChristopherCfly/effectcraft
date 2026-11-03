@@ -167,7 +167,7 @@ pub fn worker_init() {
         importer: Some(Arc::new(crate::files::WebImporter { pool })),
         expr: Some(Arc::new(effectcraft_expr::Expressions)),
         expr_check: Some(effectcraft_expr::check_syntax),
-        exporter: Some(Arc::new(effectcraft_host::FileExporter { sink: Some(sink) })),
+        exporter: Some(Arc::new(effectcraft_host::FileExporter { sink: Some(sink), ..Default::default() })),
         ..Default::default()
     };
     SESSION.with(|c| *c.borrow_mut() = Some(s));

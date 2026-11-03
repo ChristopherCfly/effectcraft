@@ -25,10 +25,7 @@ const BG: [f32; 3] = [0.1, 0.1, 0.4];
 const FRAMES: u64 = 12;
 
 fn out_dir(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-out/export-hevc-av1").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    d
+    crate::out::out_dir_in("export-hevc-av1", name)
 }
 
 fn project(audio: Option<&Path>) -> (Project, ItemId) {

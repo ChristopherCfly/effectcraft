@@ -24,7 +24,9 @@
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
 //! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
 //! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
-//! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
+//! the job by returning `false`. After each batch the footage source may close the decoders of
+//! clips the export has stopped reading (`FootageSource::release_idle`; the command-line
+//! renderer turns that on, the desktop app's sources keep theirs open for the viewer). Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
 //! (plan ADR 0001); nothing outside this crate touches them.
 //!
 //! H.264 requires even dimensions: odd output sizes are cropped by one pixel (padded when the
@@ -105,6 +107,10 @@ pub struct JobOptions<'a> {
     pub storage: Option<&'a dyn StorageQuota>,
     /// Overflow folders, in order.
     pub overflow: Vec<String>,
+    /// The memory budget in bytes of the job's layer cache, which keeps processed layer
+    /// buffers for its frames (`None`: the viewer's, [`effectcraft_render::LayerCache`]'s
+    /// default). A session that only exports can bound it (see `effectcraft-host`).
+    pub layer_cache_budget: Option<usize>,
 }
 
 /// Progress after a batch of frames.
@@ -190,7 +196,7 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
 async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
     let comp = cx.comp().ok_or(ExportError::NoComp)?;
     let total = cx.settings.frame_count(comp);
-    let mut st = State { t0, total, done: 0, progress };
+    let mut st = State { t0, total, done: 0, progress, footage: cx.footage };
     st.advance(0)?;
     let (w, h) = output_size(comp, cx.settings, cx.output);
     let mut report = match cx.output.format {
@@ -215,15 +221,19 @@ pub(crate) struct State<'p> {
     total: u64,
     done: u64,
     progress: &'p mut dyn FnMut(&Progress) -> bool,
+    /// Told after each batch, so it can close the decoders of clips the export has moved past
+    /// ([`FootageSource::release_idle`]).
+    footage: &'p dyn FootageSource,
 }
 
 impl State<'_> {
     fn snapshot(&self) -> Progress {
         Progress { done: self.done, total: self.total, elapsed: self.t0.elapsed().as_secs_f64() }
     }
-    /// Count `n` more frames; `Err(Cancelled)` when the callback says stop.
+    /// Count `n` more frames, the end of a batch; `Err(Cancelled)` when the callback says stop.
     pub(crate) fn advance(&mut self, n: u64) -> Result<()> {
         self.done += n;
+        self.footage.release_idle(n);
         let p = self.snapshot();
         if (self.progress)(&p) { Ok(()) } else { Err(ExportError::Cancelled) }
     }

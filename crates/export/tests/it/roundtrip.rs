@@ -6,7 +6,8 @@
 //! centred, starting at frame 5. So frame < 5 is background everywhere; from frame 5 the centre
 //! is red and the corners stay background.
 
-use std::path::{Path, PathBuf};
+use crate::out::out_dir;
+use std::path::Path;
 use std::process::Command;
 
 use effectcraft_color::Label;
@@ -22,13 +23,6 @@ const W: u32 = 64;
 const H: u32 = 48;
 const BG: [f32; 3] = [0.1, 0.1, 0.4];
 const FRAMES: u64 = 12;
-
-fn out_dir(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-out/export").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    d
-}
 
 fn project(audio: Option<&Path>) -> (Project, ItemId) {
     let mut p = Project::default();

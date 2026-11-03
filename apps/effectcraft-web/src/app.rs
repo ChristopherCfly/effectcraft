@@ -158,7 +158,7 @@ pub fn session() -> Session {
         expr: Some(Arc::new(effectcraft_expr::Expressions)),
         expr_check: Some(effectcraft_expr::check_syntax),
         script: Some(effectcraft_host::script::runner),
-        exporter: Some(Arc::new(effectcraft_host::FileExporter { sink: Some(files::export_sink()) })),
+        exporter: Some(Arc::new(effectcraft_host::FileExporter { sink: Some(files::export_sink()), ..Default::default() })),
         config: Some(Arc::new(persist::config())),
         offload: (!query_flag("noworkers")).then(|| {
             // Job workers render on a WebGPU device of their own (`?nogpuworkers`: their CPU).

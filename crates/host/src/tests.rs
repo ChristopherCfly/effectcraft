@@ -193,7 +193,10 @@ fn render_queue_exports_to_a_sink() {
     let got: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
     let g = got.clone();
     let mut s = super::session();
-    s.exporter = Some(Arc::new(super::FileExporter { sink: Some(Arc::new(move |p: &str, d: Vec<u8>| g.lock().unwrap().push((p.to_string(), d)))) }));
+    s.exporter = Some(Arc::new(super::FileExporter {
+        sink: Some(Arc::new(move |p: &str, d: Vec<u8>| g.lock().unwrap().push((p.to_string(), d)))),
+        ..Default::default()
+    }));
     s.execute("file.openDemoProject", json!({})).unwrap();
     // Rooted without a drive letter is not absolute on Windows, where the engine joins it to the home drive.
     let dir = if cfg!(windows) { "C:/no-such-dir-effectcraft-sink-test" } else { "/no-such-dir-effectcraft-sink-test" };
@@ -541,4 +544,73 @@ fn stereo_rig_expressions_follow_the_master_camera() {
     s.execute("prop.set", json!({"layer": ctl, "path": "effects/#1/convergence", "value": true})).unwrap();
     assert!(close(v3(&s, "transform/position"), [300.0 - d, 180.0, -800.0]), "{:?}", v3(&s, "transform/position"));
     assert!(close(v3(&s, "transform/poi"), [300.0, 180.0, 0.0]), "{:?}", v3(&s, "transform/poi"));
+}
+
+/// A session that only exports (the command-line renderer) closes the movie decoders a render
+/// has moved past; the desktop's session keeps them open for a viewer that scrubs back.
+#[test]
+fn export_sessions_release_idle_decoders() {
+    let mut s = super::session();
+    assert_eq!(s.footage.idle_release(), None);
+    super::bound_export_memory(&mut s);
+    assert_eq!(s.footage.idle_release(), Some(super::EXPORT_IDLE_FRAMES));
+}
+
+/// An export's caches hold room for a number of its frames, within a floor and the viewer's
+/// default: 512 MiB at 1080p (either way up) and below, the default from 4K.
+#[test]
+fn export_cache_budgets_follow_the_frame_size() {
+    use super::{EXPORT_CACHE_MAX, EXPORT_CACHE_MIN, export_cache_budget};
+    assert_eq!(export_cache_budget(1920, 1080), EXPORT_CACHE_MIN);
+    assert_eq!(export_cache_budget(1080, 1920), EXPORT_CACHE_MIN);
+    assert_eq!(export_cache_budget(0, 0), EXPORT_CACHE_MIN);
+    assert_eq!(export_cache_budget(2560, 1440), 2560 * 1440 * 16 * super::EXPORT_CACHE_FRAMES);
+    assert_eq!(export_cache_budget(3840, 2160), EXPORT_CACHE_MAX);
+    assert_eq!(export_cache_budget(u32::MAX, u32::MAX), EXPORT_CACHE_MAX, "no overflow");
+}
+
+/// A session that only exports sizes each job's caches for the job's frames (at its resolution):
+/// the layer cache through the job's options, the footage frame cache when the job runs. The
+/// desktop's exporter keeps the defaults.
+#[test]
+fn export_sessions_size_their_caches_for_the_job() {
+    let mut s = super::session();
+    super::bound_export_memory(&mut s);
+    let mut project = effectcraft_engine::project::Project::default();
+    let mut comp = |w, h| {
+        let c =
+            effectcraft_engine::project::Comp::new(w, h, effectcraft_engine::time::FrameRate::FPS_25, effectcraft_engine::time::Tick::from_seconds_f64(1.0));
+        project.add_item("C", Default::default(), None, effectcraft_engine::project::ItemKind::Comp(c.into()))
+    };
+    let (hd, uhd) = (comp(1920, 1080), comp(3840, 2160));
+    let layer_budget = |exporter: &super::FileExporter, comp, resolution| {
+        let mut item = effectcraft_engine::project::render_queue::RenderQueueItem::new(1, comp);
+        item.settings.resolution = resolution;
+        let job = effectcraft_engine::ExportJob {
+            project: &project,
+            footage: s.footage.as_ref(),
+            expr: None,
+            item: &item,
+            accel: None,
+            path: "out.mp4",
+            storage: None,
+            label: String::new(),
+            nested_switches: true,
+        };
+        exporter.job(&job).options.layer_cache_budget
+    };
+    let bounded = super::FileExporter { bounded: true, ..Default::default() };
+    assert_eq!(layer_budget(&bounded, hd, 1.0), Some(super::EXPORT_CACHE_MIN));
+    assert_eq!(layer_budget(&bounded, uhd, 1.0), Some(super::EXPORT_CACHE_MAX));
+    assert_eq!(layer_budget(&bounded, uhd, 0.5), Some(super::EXPORT_CACHE_MIN), "rendered at half size");
+    assert_eq!(layer_budget(&super::FileExporter::default(), hd, 1.0), None, "the desktop's exports keep the default");
+    // The footage frame cache: set when a job of the session runs.
+    assert_eq!(s.footage.cache_budget(), Some(effectcraft_media::DEFAULT_BUDGET));
+    s.execute("comp.new", json!({"name": "Tiny", "width": 16, "height": 16, "duration": 0.08})).unwrap();
+    let out = std::env::temp_dir().join(format!("effectcraft-bounded-{}", std::process::id()));
+    s.execute("renderQueue.add", json!({"format": "png", "output": out.join("f_[##].png").to_string_lossy(), "timeSpan": "comp"})).unwrap();
+    s.execute("renderQueue.render", json!({"wait": true})).unwrap();
+    s.poll_render();
+    let _ = std::fs::remove_dir_all(&out);
+    assert_eq!(s.footage.cache_budget(), Some(super::EXPORT_CACHE_MIN));
 }

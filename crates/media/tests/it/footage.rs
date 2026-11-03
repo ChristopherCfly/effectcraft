@@ -340,6 +340,83 @@ fn resampled_audio_read_in_frame_pieces_matches_ffmpeg() {
     }
 }
 
+/// H.264 with a sync sample every 10 frames, and AAC of pink noise at a low bitrate with
+/// perceptual noise substitution, so the decoder fills bands with its own noise.
+fn noisy_aac_mp4() -> Option<PathBuf> {
+    ffmpeg_fixture(
+        "noisy_aac.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=color=pink:sample_rate=48000:duration=3:seed=7",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "10",
+            "-c:a",
+            "aac",
+            "-aac_pns",
+            "1",
+            "-b:a",
+            "48k",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    )
+}
+
+/// A movie whose picture decoder the pool closed, after a render stopped reading it, gives the
+/// same frames when it is read again as one kept open, and its audio (whose reader stays open)
+/// is unchanged: a composition that comes back to a clip (later in it, then back over a passage
+/// it already played) renders and sounds exactly as before.
+#[test]
+fn a_released_movie_reopens_with_identical_frames_and_unchanged_audio() {
+    let Some(p) = noisy_aac_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    assert!(f.has_video && f.has_audio);
+    let kept = MediaPool::new();
+    let released = MediaPool::new();
+    released.set_idle_release(Some(1));
+    for pool in [&kept, &released] {
+        // (a read-ahead still running would hold the source open)
+        pool.set_read_ahead(false);
+    }
+    let rate = 48_000u32;
+    // Visits as frame ranges, each read as an export reads: a frame, then its audio.
+    for (visit, frames) in [0..20i64, 45..70, 3..30].into_iter().enumerate() {
+        for n in frames {
+            let t = t_of(f.frame_rate, n);
+            let (a, b) = (kept.frame(ItemId(1), &f, t).expect("frame"), released.frame(ItemId(1), &f, t).expect("frame"));
+            assert!(a.data == b.data, "visit {visit}: frame {n} differs");
+            let s0 = t.to_units_floor(rate as i64);
+            let len = (t_of(f.frame_rate, n + 1).to_units_floor(rate as i64) - s0) as usize;
+            let start = Tick::from_units(s0, rate as i64);
+            let (a, b) = (kept.audio_samples(&f, start, len, rate), released.audio_samples(&f, start, len, rate));
+            assert!(a == b, "visit {visit}: the audio of frame {n} differs");
+        }
+        // The render moves on to other clips: this one goes unread, and its frames leave the
+        // frame cache, so the next visit decodes.
+        for pool in [&kept, &released] {
+            for _ in 0..3 {
+                pool.release_idle(1);
+            }
+            pool.clear_frames();
+        }
+        assert_eq!(released.stats().released, visit as u64 + 1, "visit {visit}: its picture decoder closed");
+    }
+    assert_eq!((kept.stats().opened, kept.stats().released), (1, 0));
+    // One audio reader, kept, and a picture decoder for each visit.
+    assert_eq!((released.stats().opened, released.stats().open), (4, 1));
+}
+
 /// The H.264 fixture with the rotation part of its video track header's matrix (`[a b; c d]`,
 /// 16.16 fixed point) replaced: what a phone writes for a movie shot with the camera turned.
 fn turned_mp4(p: &Path, abcd: [i32; 4]) -> Arc<[u8]> {

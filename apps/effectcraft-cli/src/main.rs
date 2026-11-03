@@ -702,6 +702,8 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         return usage_err("render runs headless; use `exec renderQueue.add` / `renderQueue.render` with --bridge");
     }
     let mut s = session(args)?;
+    // Nothing here scrubs back: decoders close once the render has moved past their clip.
+    effectcraft_host::bound_export_memory(&mut s);
     if args.opt("--template").is_some() {
         template::prepare(&mut s, args)?;
     } else if let Some(p) = &args.project {

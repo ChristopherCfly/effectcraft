@@ -2,7 +2,8 @@
 //! (`Accelerator::comp_frame_yuv420`): the file is the same as the CPU conversion's, and frames
 //! the accelerator can't take (odd sizes, crop) fall back to the RGBA path.
 
-use std::path::{Path, PathBuf};
+use crate::out::out_dir;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use effectcraft_color::Label;
@@ -66,13 +67,6 @@ impl Accelerator for Fake {
     fn effects(&self, _chain: &[effectcraft_render::FxStep], _buf: &effectcraft_effects::Buf, _levels: Option<f32>) -> Option<effectcraft_effects::Buf> {
         None
     }
-}
-
-fn out_dir(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-out/export").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    d
 }
 
 fn project() -> (Project, ItemId) {

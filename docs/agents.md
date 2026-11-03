@@ -680,6 +680,16 @@ effectcraft-cli exec file.importLottie '{"path":"anim.json"}' main.ecproj --save
 effectcraft-cli render main.ecproj --comp Main --out main.mov --format prores --progress   # progress lines on stderr for a program that reads them
 ```
 
+`render` keeps its memory bounded however many movie clips the composition uses
+(`effectcraft_host::bound_export_memory`): a clip's picture decoder, with its cache of decoded
+frames, closes once the render has gone 48 frames without reading it, and opens again (giving the
+same frames) if the composition comes back to the clip. Audio readers stay open, as reopening one
+could change the sound of a passage played again; they keep the audio they decoded (a few MB for a
+clip of a few seconds). The footage frame cache and the job's layer cache hold 16 of its frames
+(512 MB up to 1080p, the viewer's 1 GB from 4K). The desktop app keeps its decoders open and its
+caches as set for its viewer. On Linux with glibc, `MALLOC_ARENA_MAX=2` in the environment also
+stops the allocator from holding on to freed decoder memory in per-thread arenas.
+
 Scripts written against After Effects' documented scripting API run with `script`:
 
 ```sh

@@ -182,7 +182,7 @@ impl Offload for Manual {
 
 fn exporter() -> Arc<effectcraft_host::FileExporter> {
     let sink: Arc<dyn Fn(&str, Vec<u8>) + Send + Sync> = Arc::new(|_: &str, _: Vec<u8>| {});
-    Arc::new(effectcraft_host::FileExporter { sink: Some(sink) })
+    Arc::new(effectcraft_host::FileExporter { sink: Some(sink), ..Default::default() })
 }
 
 #[test]

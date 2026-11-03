@@ -30,7 +30,7 @@ type Files = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 fn exporter(files: Files) -> Arc<effectcraft_host::FileExporter> {
     let sink: Arc<dyn Fn(&str, Vec<u8>) + Send + Sync> = Arc::new(move |p: &str, d: Vec<u8>| files.lock().unwrap().push((p.to_string(), d)));
-    Arc::new(effectcraft_host::FileExporter { sink: Some(sink) })
+    Arc::new(effectcraft_host::FileExporter { sink: Some(sink), ..Default::default() })
 }
 
 /// Run `req` on a worker session (`gpu`: its accelerator); its replies and the files it wrote.
